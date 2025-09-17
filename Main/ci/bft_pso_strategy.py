@@ -1,3 +1,202 @@
+import io
+import json
+import requests
+import base64
+import time
+import threading
+from typing import Dict, List, Optional, Tuple, Any
+from dataclasses import dataclass
+from enum import Enum
+import logging
+import os
+import numpy as np
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torch.optim as optim
+from torch.utils.data import DataLoader, Subset
+from torchvision import datasets, transforms
+
+# Configure logging
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+# PSO Parameters
+W = 0.5  # Inertia weight
+C1 = 2.0  # Cognitive coefficient
+C2 = 2.0  # Social coefficient
+
+
+class ClientStatus(Enum):
+    ACTIVE = "active"
+    FILTERED_BFT = "filtered_bft"
+    FILTERED_NO_CHANGE = "filtered_no_change"
+    SELECTED = "selected"
+    ERROR = "error"
+
+
+@dataclass
+class ClientMetrics:
+    accuracy: float = 0.0
+    false_positive_rate: float = 0.0
+    response_time: float = 0.0
+    last_update: float = 0.0
+
+
+@dataclass
+class ClientResult:
+    client_id: str
+    parameters: Dict[str, torch.Tensor]  # Use state_dict format
+    num_examples: int
+    metrics: ClientMetrics
+    status: ClientStatus = ClientStatus.ACTIVE
+
+
+class CNNModel(nn.Module):
+    """A CNN model for MNIST."""
+    def __init__(self, num_classes=10):
+        super().__init__()
+        # First convolutional layer
+        self.conv1 = nn.Conv2d(1, 32, kernel_size=3, padding=1)
+        self.pool = nn.MaxPool2d(2, 2)
+        # Second convolutional layer
+        self.conv2 = nn.Conv2d(32, 64, 3, padding=1)
+        # Fully connected layers
+        self.fc1 = nn.Linear(64 * 7 * 7, 128)
+        self.fc2 = nn.Linear(128, num_classes)
+
+    def forward(self, x):
+        x = self.pool(F.relu(self.conv1(x))) # [batch, 32, 14, 14]
+        x = self.pool(F.relu(self.conv2(x))) # [batch, 64, 7, 7]
+        x = x.view(-1, 64 * 7 * 7) # flatten
+        x = F.relu(self.fc1(x))
+        x = self.fc2(x)
+        return x
+
+
+class ModelUtils:
+    """Utility functions for model parameter handling."""
+
+    @staticmethod
+    def get_parameters(model: nn.Module) -> List[np.ndarray]:
+        """Retrieves model parameters as a list of NumPy arrays."""
+        return [val.cpu().numpy() for _, val in model.state_dict().items()]
+
+    @staticmethod
+    def set_parameters(model: nn.Module, parameters: List[np.ndarray]):
+        """Sets model parameters from a list of NumPy arrays."""
+        params_dict = zip(model.state_dict().keys(), parameters)
+        state_dict = {k: torch.Tensor(v) for k, v in params_dict}
+        model.load_state_dict(state_dict, strict=True)
+
+
+class DataLoader:
+    """Loads reference dataset for server-side training."""
+
+    @staticmethod
+    def load_reference_data(batch_size: int = 32) -> DataLoader:
+        """Loads a small subset of MNIST as the server's trusted dataset."""
+        transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,))
+        ])
+        dataset = datasets.MNIST(root="./data/archive_MNIST_raw", train=True, download=True, transform=transform)
+        indices = torch.randperm(len(dataset))[:500]
+        subset_dataset = Subset(dataset, indices)
+        return torch.utils.data.DataLoader(subset_dataset, batch_size=batch_size, shuffle=True)
+
+
+class ByzantineFaultTolerance:
+    """Implements Byzantine Fault Tolerance filtering."""
+
+    @staticmethod
+    def euclidean_distance(arr1: np.ndarray, arr2: np.ndarray) -> float:
+        """Computes Euclidean distance between two arrays."""
+        return np.linalg.norm(arr1 - arr2)
+
+    @staticmethod
+    def flatten_parameters(parameters: Dict[str, torch.Tensor]) -> np.ndarray:
+        """Flattens parameter list into single 1D array."""
+        return np.concatenate([param.cpu().numpy().flatten() for param in parameters.values()])
+
+    @staticmethod
+    def compute_update(old_params: Dict[str, torch.Tensor], new_params: Dict[str, torch.Tensor]) -> Dict[
+        str, torch.Tensor]:
+        """Computes parameter update (difference between old and new)."""
+        return {k: new_params[k] - old_params[k] for k in old_params.keys()}
+
+    def filter_clients(self,
+                       client_results: List[ClientResult],
+                       reference_update: Dict[str, torch.Tensor],
+                       global_parameters: Dict[str, torch.Tensor],
+                       k: float = 1.0) -> List[ClientResult]:
+        """Filters out potentially Byzantine clients."""
+        reference_update_flat = self.flatten_parameters(reference_update)
+        filtered_results = []
+        bft_passed_clients = []
+
+        for client_result in client_results:
+            try:
+                # Compute client update and distance from reference
+                client_update = self.compute_update(global_parameters, client_result.parameters)
+                client_update_flat = self.flatten_parameters(client_update)
+                distance = self.euclidean_distance(client_update_flat, reference_update_flat)
+                reference_norm = np.linalg.norm(reference_update_flat)
+
+                if distance <= k * reference_norm:
+                    filtered_results.append(client_result)
+                    bft_passed_clients.append(client_result.client_id)
+                else:
+                    logger.warning(
+                        f"Client {client_result.client_id} filtered by BFT. Distance too high: {distance:.4f}")
+                    client_result.status = ClientStatus.FILTERED_BFT
+
+            except Exception as e:
+                logger.error(f"Error during BFT filtering for client {client_result.client_id}: {e}")
+                client_result.status = ClientStatus.ERROR
+
+        print("---")
+        print("Candidates permitted by BFT:")
+        print(bft_passed_clients)
+        return filtered_results
+
+
+class LocalStorage:
+    """
+    Handles local filesystem operations for model weights storage.
+    Replaces GitHubStorage.
+    """
+
+    def list_folder_contents(self, folder_path: str):
+        """Lists .pth files in a local folder."""
+        try:
+            return [f for f in os.listdir(folder_path) if f.endswith(".pth")]
+        except FileNotFoundError:
+            return []
+
+    def load_eligible_clients_from_log(self, filename: str):
+        """Reads eligible clients from a local log file."""
+        if not os.path.exists(filename):
+            return []
+        with open(filename, "r") as f:
+            return [line.strip() for line in f if line.strip()]
+
+    def save_state_dict(self, state_dict, filename: str):
+        """Saves a PyTorch state_dict to local file."""
+        torch.save(state_dict, filename)
+
+    def load_state_dict(self, filename: str):
+        """Loads a PyTorch state_dict from local file."""
+        if not os.path.exists(filename):
+            return None
+        try:
+            # Change the torch.load line to explicitly set weights_only=False
+            return torch.load(filename, weights_only=False)
+        except Exception as e:
+            logger.error(f"Error loading state dict from {filename}: {e}")
+            return None
+
 class Particle:
     """Represents a particle in the PSO swarm."""
 
