@@ -484,3 +484,4 @@ if __name__ == "__main__":
 
     # Run a single full aggregation and update cycle
     strategy.run_full_cycle(client_updates_folder=CLIENT_UPDATES_FOLDER)
+    #
