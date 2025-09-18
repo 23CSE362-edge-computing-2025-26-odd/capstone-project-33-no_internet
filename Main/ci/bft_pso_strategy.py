@@ -130,7 +130,7 @@ class ByzantineFaultTolerance:
                        client_results: List[ClientResult],
                        reference_update: Dict[str, torch.Tensor],
                        global_parameters: Dict[str, torch.Tensor],
-                       k: float = 1.0) -> List[ClientResult]:
+                       k: float = 1.25) -> List[ClientResult]:
         """Filters out potentially Byzantine clients."""
         reference_update_flat = self.flatten_parameters(reference_update)
         filtered_results = []
@@ -144,7 +144,9 @@ class ByzantineFaultTolerance:
                 distance = self.euclidean_distance(client_update_flat, reference_update_flat)
                 reference_norm = np.linalg.norm(reference_update_flat)
 
-                if distance <= k * reference_norm:
+                print(f"Cutoff Distance: {k*reference_norm} \n")
+
+                if distance <= k*reference_norm:
                     filtered_results.append(client_result)
                     bft_passed_clients.append(client_result.client_id)
                 else:
@@ -301,7 +303,7 @@ class HybridStrategy:
     """
 
     def __init__(self,
-                 k: float = 29.0,
+                 k: float = 1.25,
                  min_clients: int = 2,
                  github_owner: str = "EdgeComputing-x-CI",
                  github_repo: str = "EdgeComputing-x-CI",
@@ -474,7 +476,7 @@ class HybridStrategy:
 if __name__ == "__main__":
     # Configuration
     # This path is correct because the script is being run from ci/
-    CLIENT_UPDATES_FOLDER = "../client_updates"
+    CLIENT_UPDATES_FOLDER = "../edgeComputing/client_updates"
 
     # Initialize strategy
     strategy = HybridStrategy()
