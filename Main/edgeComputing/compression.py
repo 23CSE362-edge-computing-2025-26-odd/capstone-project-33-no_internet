@@ -1,4 +1,5 @@
 # edgeComputing/compression.py
+import io, pickle, gzip
 import torch
 
 
@@ -69,3 +70,50 @@ if __name__ == "__main__":
     update_size = 1.0  # MB
     skip = should_skip(bandwidth, update_size)
     print("Should skip:", skip)
+
+#append some code
+# ---------- helpers to integrate with train_one_round ----------
+
+import io, pickle
+
+def compress_state_dict(state_dict, method="topk", topk_ratio=0.5):
+    """
+    Compress a PyTorch state_dict and return bytes (pickle).
+    Uses topk_sparsify when method=="topk".
+    """
+    # Convert state_dict tensors to CPU tensors
+    cpu_state = {k: v.detach().cpu() for k, v in state_dict.items()}
+
+    if method == "topk":
+        sparse = topk_sparsify(cpu_state, k=topk_ratio)
+        # Save sparse dict as bytes for size measurement / transport
+        buf = io.BytesIO()
+        # Use torch.save so types are preserved
+        torch.save(sparse, buf)
+        #return buf.getvalue()
+        return gzip.compress(buf.getvalue())
+    else:
+        # fallback: full state bytes
+        buf = io.BytesIO()
+        torch.save(cpu_state, buf)
+        return buf.getvalue()
+
+
+def decompress_state_bytes(bts):
+    """
+    Decompress bytes produced by compress_state_dict back to a state-dict-like object.
+    Returns the object loaded by torch.load (sparse representation).
+    """
+    buf = io.BytesIO(bts)
+    obj = torch.load(buf)
+    return obj
+
+
+def bytes_size(xbytes):
+    """helper to get length in bytes"""
+    return len(xbytes)
+
+
+# compatibility wrapper
+def decompress_state_dict(bts):
+    return decompress_state_bytes(bts)
